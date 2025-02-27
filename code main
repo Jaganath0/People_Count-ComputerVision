@@ -1,0 +1,122 @@
+import cv2
+import pandas as pd
+from datetime import datetime
+from ultralytics import YOLO
+from tracker import Tracker  # Ensure this exists and is implemented correctly
+import cvzone
+
+# Constants
+VIDEO_PATH = "test_4.mp4"  # Path to the video file
+YOLO_MODEL_PATH = "yolov8s.pt"  # YOLOv8 model path
+COCO_NAMES_PATH = "coco.names"  # Path to the COCO class names
+OUTPUT_VIDEO_PATH = "output_final.avi"  # Path to save the output video
+FRAME_SIZE = (1020, 500)  # Resize frame dimensions
+REFERENCE_LINE_DOWN = 300  # Line for down counting (entry)
+REFERENCE_LINE_UP = 250  # Line for up counting (exit)
+OFFSET = 10  # Error margin for counting
+CSV_OUTPUT_PATH = "people_count.csv"  # Path to save the CSV file
+
+# Initialize the YOLO model
+model = YOLO(YOLO_MODEL_PATH)
+
+# Load class names
+with open(COCO_NAMES_PATH, 'r') as file:
+    class_list = file.read().strip().split('\n')
+
+# Initialize video capture and writer
+cap = cv2.VideoCapture(VIDEO_PATH)
+output = cv2.VideoWriter(
+    OUTPUT_VIDEO_PATH,
+    cv2.VideoWriter_fourcc(*'XVID'),
+    30,
+    FRAME_SIZE
+)
+
+# Initialize tracker and counters
+tracker = Tracker()  # Ensure your tracker logic is good (e.g., using SORT, DeepSORT, or other robust trackers)
+counter_down = {}  # Stores IDs and their entry timestamps
+counter_up = {}  # Stores IDs and their exit timestamps
+
+# Data for CSV
+csv_data = []
+
+def process_frame(frame, frame_number, timestamp):
+    """
+    Process a single frame: detect, track, and count people.
+    """
+    global csv_data  # To log data for the CSV file
+
+    # Resize frame
+    frame = cv2.resize(frame, FRAME_SIZE)
+
+    # Predict with YOLO
+    results = model.predict(frame, stream=True)
+    detections = []
+
+    # Extract detections for "person" class with a higher confidence threshold
+    for result in results:
+        boxes = result.boxes
+        for box in boxes:
+            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
+            confidence = box.conf[0].item()
+            class_id = int(box.cls[0].item())
+
+            if class_list[class_id] == "person" and confidence > 0.6:  # Increased confidence threshold
+                detections.append([x1, y1, x2, y2])
+
+    # Update tracker
+    tracked_objects = tracker.update(detections)
+
+    # Track entry and exit
+    for obj in tracked_objects:
+        x1, y1, x2, y2, obj_id = obj
+        cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+
+        # Draw bounding box and center
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        cv2.circle(frame, (cx, cy), 4, (255, 0, 255), -1)
+        cvzone.putTextRect(frame, f'ID: {obj_id}', (x1, y1 - 10), 1, 2)
+
+        # Check if person is crossing the down line (entry)
+        if REFERENCE_LINE_DOWN - OFFSET < cy < REFERENCE_LINE_DOWN + OFFSET:
+            if obj_id not in counter_down:
+                counter_down[obj_id] = timestamp  # Log entry time
+
+        # Check if person is crossing the up line (exit)
+        if REFERENCE_LINE_UP - OFFSET < cy < REFERENCE_LINE_UP + OFFSET:
+            if obj_id not in counter_up:
+                counter_up[obj_id] = timestamp  # Log exit time
+
+    # Draw reference lines
+    cv2.line(frame, (0, REFERENCE_LINE_DOWN), (FRAME_SIZE[0], REFERENCE_LINE_DOWN), (0, 255, 0), 2)
+    cv2.line(frame, (0, REFERENCE_LINE_UP), (FRAME_SIZE[0], REFERENCE_LINE_UP), (0, 255, 255), 2)
+
+    # Display counts
+    cvzone.putTextRect(frame, f'Count Down: {len(counter_down)}', (50, 50), 2, 2, (255, 0, 0), 2)
+    cvzone.putTextRect(frame, f'Count Up: {len(counter_up)}', (50, 100), 2, 2, (0, 0, 255), 2)
+
+    # Log individual entry and exit for CSV
+    for obj_id, entry_time in counter_down.items():
+        exit_time = counter_up.get(obj_id, None)
+        csv_data.append({
+            "Person ID": obj_id,
+            "Entry Time": entry_time if entry_time else "N/A",
+            "Exit Time": exit_time if exit_time else "N/A",
+        })
+
+    return frame
+
+# Main processing loop
+frame_number = 0
+start_time = datetime.now()  # Video start time
+
+while cap.isOpened():
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    # Process the frame
+    frame_number += 1
+    elapsed_seconds = frame_number / 30  # Assuming 30 FPS
+    timestamp = start_time + pd.to_timedelta(elapsed_seconds, unit='s')
+    processed_frame = process_frame(frame, frame_number, timestamp)
